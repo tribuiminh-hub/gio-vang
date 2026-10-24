@@ -1,0 +1,98 @@
+rules_version = '2';
+
+// Giờ Vàng — luật bảo mật Firestore.
+// Ba mẹ: đăng nhập Google, có tên trong parentUids của gia đình.
+// Máy của con: đăng nhập ẩn danh, đã ghép cặp bằng mã (devices/{uid}).
+service cloud.firestore {
+  match /databases/{db}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+    function famPath(fid) {
+      return /databases/$(db)/documents/families/$(fid);
+    }
+    function isParent(fid) {
+      return signedIn() && request.auth.uid in get(famPath(fid)).data.parentUids;
+    }
+    function isDevice(fid) {
+      return signedIn() && exists(/databases/$(db)/documents/families/$(fid)/devices/$(request.auth.uid));
+    }
+    function member(fid) {
+      return isParent(fid) || isDevice(fid);
+    }
+    function pairDoc(code) {
+      return get(/databases/$(db)/documents/pairCodes/$(code)).data;
+    }
+    // Các trường máy của con không được tự sửa
+    function noParentFields(keys) {
+      return !keys.hasAny(['bonusMin', 'cutoffExtendMin']);
+    }
+
+    // Mã ghép cặp: 8 ký tự ngẫu nhiên, hết hạn sau 15 phút
+    match /pairCodes/{code} {
+      allow get: if signedIn();
+      allow list: if false;
+      allow create: if isParent(request.resource.data.familyId)
+        && request.resource.data.expiresAt is timestamp;
+      allow delete: if signedIn() && isParent(resource.data.familyId);
+    }
+
+    match /families/{fid} {
+      allow create: if signedIn()
+        && request.resource.data.parentUids == [request.auth.uid];
+      allow read: if signedIn()
+        && (request.auth.uid in resource.data.parentUids || isDevice(fid));
+      allow update: if signedIn() && request.auth.uid in resource.data.parentUids
+        && request.resource.data.parentUids.size() > 0;
+      allow delete: if false;
+
+      match /config/{doc} {
+        allow read: if member(fid);
+        allow write: if isParent(fid);
+      }
+
+      match /devices/{uid} {
+        allow read: if isParent(fid) || (signedIn() && request.auth.uid == uid);
+        allow create: if signedIn() && request.auth.uid == uid
+          && request.resource.data.pairCode is string
+          && pairDoc(request.resource.data.pairCode).familyId == fid
+          && pairDoc(request.resource.data.pairCode).expiresAt > request.time;
+        allow update: if isParent(fid)
+          || (signedIn() && request.auth.uid == uid
+              && request.resource.data.pairCode == resource.data.pairCode);
+        allow delete: if isParent(fid);
+      }
+
+      match /days/{day} {
+        allow read: if member(fid);
+        allow write: if isParent(fid);
+        allow create: if isDevice(fid)
+          && request.resource.data.get('bonusMin', 0) == 0
+          && request.resource.data.get('cutoffExtendMin', 0) == 0;
+        allow update: if isDevice(fid)
+          && noParentFields(request.resource.data.diff(resource.data).affectedKeys())
+          && request.resource.data.get('playedSec', 0) >= resource.data.get('playedSec', 0);
+      }
+
+      match /requests/{rid} {
+        allow read: if member(fid);
+        allow create: if isDevice(fid)
+          && request.resource.data.deviceUid == request.auth.uid
+          && request.resource.data.status == 'pending'
+          && request.resource.data.minutes is int
+          && request.resource.data.minutes > 0
+          && request.resource.data.minutes <= 600;
+        allow update, delete: if isParent(fid);
+      }
+
+      match /apps/{pkg} {
+        allow read: if member(fid);
+        allow write: if isParent(fid);
+        allow create: if isDevice(fid) && request.resource.data.category == 'pending';
+        allow update: if isDevice(fid)
+          && request.resource.data.category == resource.data.category;
+      }
+    }
+  }
+}
